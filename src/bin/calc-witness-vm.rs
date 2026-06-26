@@ -8,7 +8,7 @@ use std::time::Instant;
 use ruint::aliases::U256;
 use circom_witnesscalc::{wtns_from_u256_witness, Error};
 use circom_witnesscalc::Error::InputsUnmarshal;
-use circom_witnesscalc::storage::{deserialize_witnesscalc_vm, InputList};
+use circom_witnesscalc::storage::{deserialize_witnesscalc_vm, init_input_signals};
 use circom_witnesscalc::vm::{build_component, execute, Template};
 
 struct Args {
@@ -221,8 +221,15 @@ fn main() {
 
     let start = Instant::now();
     let mut signals = Vec::new();
+    if signals.try_reserve(cs.signals_num).is_err() {
+        eprintln!("Failed to allocate signal storage");
+        std::process::exit(1);
+    }
     signals.resize(cs.signals_num, None);
-    init_input_signals(&cs.inputs, &inputs, &mut signals);
+    if let Err(e) = init_input_signals(&cs.inputs, &inputs, &mut signals) {
+        eprintln!("Failed to initialize input signals: {}", e);
+        std::process::exit(1);
+    }
     println!("Signals initialized in {:?}.", start.elapsed());
 
     let start = Instant::now();
@@ -234,10 +241,13 @@ fn main() {
 
     let start = Instant::now();
 
-    let mut witness = Vec::with_capacity(cs.witness_signals.len());
-    for w in cs.witness_signals.iter() {
-        witness.push(signals[*w].unwrap());
-    }
+    let witness = match collect_witness(&signals, &cs.witness_signals) {
+        Ok(witness) => witness,
+        Err(e) => {
+            eprintln!("Failed to collect witness signals: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     let wtns_bytes = wtns_from_u256_witness(witness);
 
@@ -251,30 +261,23 @@ fn main() {
     println!("Total time {:?}", start0.elapsed());
 }
 
-fn init_input_signals(
-    inputs_desc: &InputList,
-    inputs: &HashMap<String, Vec<U256>>,
-    signals: &mut [Option<U256>],
-) {
-    signals[0] = Some(U256::from(1u64));
-
-    for (name, offset, len) in inputs_desc {
-        match inputs.get(name) {
-            Some(values) => {
-                if values.len() != *len {
-                    panic!(
-                        "input signal {} has different length in inputs file, want {}, actual {}",
-                        name, len, values.len());
-                }
-                for (i, v) in values.iter().enumerate() {
-                    signals[*offset + i] = Some(*v);
-                }
-            }
-            None => {
-                panic!("input signal {} is not found in inputs file", name);
-            }
-        }
+fn collect_witness(
+    signals: &[Option<U256>],
+    witness_signals: &[usize],
+) -> Result<Vec<U256>, String> {
+    let mut witness = Vec::new();
+    witness.try_reserve(witness_signals.len())
+        .map_err(|_| "witness allocation failed".to_string())?;
+    for idx in witness_signals {
+        let signal = signals.get(*idx).copied().ok_or_else(|| {
+            format!("witness signal index outside signal range: {}", idx)
+        })?;
+        let signal = signal.ok_or_else(|| {
+            format!("witness signal {} is unset", idx)
+        })?;
+        witness.push(signal);
     }
+    Ok(witness)
 }
 
 #[cfg(test)]

@@ -4,6 +4,10 @@ use std::sync::{Arc, RwLock};
 use crate::field::{FieldOperations, FieldOps};
 use crate::vm2::{Component, InputInfo, InputInfoSliceExt, Template, Type, TypeFieldKind};
 
+fn setup_error(msg: impl Into<String>) -> Box<dyn Error> {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into()).into()
+}
+
 /// Initialize signals array with input values from JSON
 pub fn init_signals<T: FieldOps, F>(
     inputs_json: impl std::io::Read, ff: &F, types: &[Type],
@@ -22,15 +26,23 @@ where
         };
     }
 
-    let first_offset = input_infos.min_offset().unwrap();
+    let first_offset = input_infos.min_offset()
+        .ok_or_else(|| setup_error("input infos are empty"))?;
     let total_inputs = input_infos.get_total_size(types)?;
-    let mut signals_set = vec![false; total_inputs];
+    let mut signals_set = Vec::new();
+    signals_set.try_reserve(total_inputs)
+        .map_err(|_| setup_error("input signal tracking allocation failed"))?;
+    signals_set.resize(total_inputs, false);
 
     for (path, value) in input_signals.iter() {
         let signal_idx = path_to_signal_idx(path, input_infos, types)
             .ok_or_else(|| format!("signal {} is not found in input infos", path))?;
 
-        let local_idx = signal_idx - first_offset;
+        let local_idx = signal_idx.checked_sub(first_offset)
+            .ok_or_else(|| setup_error("input signal range outside declared inputs"))?;
+        if local_idx >= total_inputs {
+            return Err(setup_error("input signal range outside declared inputs"));
+        }
         if signals_set[local_idx] {
             return Err(format!("duplicate signal at path {}", path).into());
         }
@@ -40,7 +52,9 @@ where
 
     // Check if any input signals were not provided
     if let Some(missing_idx) = signals_set.iter().position(|&s| !s) {
-        return Err(format!("missing input signal at offset {}", first_offset + missing_idx).into());
+        let offset = first_offset.checked_add(missing_idx)
+            .ok_or_else(|| setup_error("input signal range overflows"))?;
+        return Err(format!("missing input signal at offset {}", offset).into());
     }
 
     Ok(())
@@ -51,7 +65,7 @@ fn path_to_signal_idx(path: &str, input_infos: &[InputInfo], types: &[Type]) -> 
     // Handle root array: "[5]" -> first_offset + 5
     if path.starts_with('[') {
         if let Some(idx) = parse_root_array_index(path) {
-            return Some(input_infos.first()?.offset + idx);
+            return input_infos.first()?.offset.checked_add(idx);
         }
     }
 
@@ -69,7 +83,7 @@ fn path_to_signal_idx(path: &str, input_infos: &[InputInfo], types: &[Type]) -> 
         }
 
         if let Some(offset) = calculate_offset_from_suffix(suffix, info, types) {
-            return Some(info.offset + offset);
+            return info.offset.checked_add(offset);
         }
     }
 
@@ -100,15 +114,21 @@ fn calculate_offset_from_suffix(suffix: &str, info: &InputInfo, types: &[Type]) 
         };
     }
 
-    let bus_type = info.type_id.as_ref()
-        .and_then(|id| types.iter().find(|t| &t.name == id));
+    let bus_idx = info.type_id.as_ref()
+        .and_then(|id| types.iter().position(|t| &t.name == id));
+    let bus_type = bus_idx.and_then(|idx| types.get(idx));
 
     // Handle input array indexing first
     if !info.lengths.is_empty() {
         // Calculate total size of this input
-        let bus_size = bus_type.map(|b| calculate_bus_total_size(b, types)).unwrap_or(1);
-        let array_count: usize = info.lengths.iter().product();
-        let total_size = array_count * bus_size;
+        let bus_size = match bus_idx {
+            Some(idx) => calculate_bus_total_size(idx, types)?,
+            None => 1,
+        };
+        let array_count = info.lengths.iter().try_fold(1usize, |acc, dim| {
+            acc.checked_mul(*dim)
+        })?;
+        let total_size = array_count.checked_mul(bus_size)?;
 
         // Try as flat index first (simple "[N]" with no further access)
         if let Some(flat_idx) = try_parse_flat_index(suffix, total_size) {
@@ -119,7 +139,7 @@ fn calculate_offset_from_suffix(suffix: &str, info: &InputInfo, types: &[Type]) 
 
         if let Some(bus) = bus_type {
             let inner_offset = calculate_bus_offset(remaining, bus, types)?;
-            Some(array_offset * bus_size + inner_offset)
+            array_offset.checked_mul(bus_size)?.checked_add(inner_offset)
         } else {
             // Plain array - remaining should be empty
             if remaining.is_empty() {
@@ -185,15 +205,21 @@ fn parse_array_indices<'a>(suffix: &'a str, dimensions: &[usize]) -> Option<(usi
 
     if indices.len() == dimensions.len() {
         // Multi-dimensional indexing
-        let flat_idx = indices.iter()
-            .zip(dimensions.iter())
-            .fold(0, |acc, (&idx, &dim)| acc * dim + idx);
+        let mut flat_idx = 0usize;
+        for (&idx, &dim) in indices.iter().zip(dimensions.iter()) {
+            if idx >= dim {
+                return None;
+            }
+            flat_idx = flat_idx.checked_mul(dim)?.checked_add(idx)?;
+        }
         return Some((flat_idx, remaining));
     }
 
     // Try as flat index (single bracket with full array offset)
     if indices.len() == 1 {
-        let total_size: usize = dimensions.iter().product();
+        let total_size = dimensions.iter().try_fold(1usize, |acc, dim| {
+            acc.checked_mul(*dim)
+        })?;
         if indices[0] < total_size {
             // Reparse to get remaining after first bracket only
             let close = suffix.find(']')?;
@@ -223,13 +249,13 @@ fn calculate_bus_offset(suffix: &str, bus_type: &Type, types: &[Type]) -> Option
     if let Some(field_part) = suffix.strip_prefix('.') {
         let (field_name, rest) = split_field_name(field_part);
 
-        let mut offset = 0;
+        let mut offset = 0usize;
         for field in &bus_type.fields {
             if field.name == field_name {
                 let inner = calculate_field_offset(rest, field, types)?;
-                return Some(offset + inner);
+                return offset.checked_add(inner);
             }
-            offset += calculate_field_total_size(field, types);
+            offset = offset.checked_add(calculate_field_total_size(field, types)?)?;
         }
     }
 
@@ -238,17 +264,18 @@ fn calculate_bus_offset(suffix: &str, bus_type: &Type, types: &[Type]) -> Option
 
 /// Convert flat index within a bus to offset
 fn flat_idx_to_bus_offset(flat_idx: usize, remaining: &str, bus_type: &Type, types: &[Type]) -> Option<usize> {
-    let mut current_offset = 0;
+    let mut current_offset = 0usize;
 
     for field in &bus_type.fields {
-        let field_size = calculate_field_total_size(field, types);
+        let field_size = calculate_field_total_size(field, types)?;
 
-        if flat_idx < current_offset + field_size {
+        let field_end = current_offset.checked_add(field_size)?;
+        if flat_idx < field_end {
             let idx_within = flat_idx - current_offset;
             let inner = calculate_field_offset_by_flat_idx(idx_within, remaining, field, types)?;
-            return Some(current_offset + inner);
+            return current_offset.checked_add(inner);
         }
-        current_offset += field_size;
+        current_offset = field_end;
     }
 
     None
@@ -277,7 +304,7 @@ fn calculate_field_offset(suffix: &str, field: &crate::vm2::TypeField, types: &[
         }
         TypeFieldKind::Bus(bus_idx) => {
             let nested_bus = types.get(*bus_idx)?;
-            let bus_size = calculate_bus_total_size(nested_bus, types);
+            let bus_size = calculate_bus_total_size(*bus_idx, types)?;
 
             if field.dims.is_empty() {
                 // Single nested bus
@@ -286,7 +313,7 @@ fn calculate_field_offset(suffix: &str, field: &crate::vm2::TypeField, types: &[
                 // Array of buses
                 let (array_offset, remaining) = parse_array_indices(suffix, &field.dims)?;
                 let inner = calculate_bus_offset(remaining, nested_bus, types)?;
-                Some(array_offset * bus_size + inner)
+                array_offset.checked_mul(bus_size)?.checked_add(inner)
             }
         }
     }
@@ -309,17 +336,20 @@ fn calculate_field_offset_by_flat_idx(
         }
         TypeFieldKind::Bus(bus_idx) => {
             let nested_bus = types.get(*bus_idx)?;
-            let bus_size = calculate_bus_total_size(nested_bus, types);
+            let bus_size = calculate_bus_total_size(*bus_idx, types)?;
 
             if field.dims.is_empty() {
                 // Single nested bus - recurse into it
                 flat_idx_to_bus_offset(flat_idx, remaining, nested_bus, types)
             } else {
                 // Array of buses
+                if bus_size == 0 {
+                    return None;
+                }
                 let array_idx = flat_idx / bus_size;
                 let idx_within_bus = flat_idx % bus_size;
                 let inner = flat_idx_to_bus_offset(idx_within_bus, remaining, nested_bus, types)?;
-                Some(array_idx * bus_size + inner)
+                array_idx.checked_mul(bus_size)?.checked_add(inner)
             }
         }
     }
@@ -342,65 +372,108 @@ fn split_field_name(s: &str) -> (&str, &str) {
 }
 
 /// Calculate the total size of a field including array dimensions
-fn calculate_field_total_size(field: &crate::vm2::TypeField, types: &[Type]) -> usize {
+fn calculate_field_total_size(field: &crate::vm2::TypeField, types: &[Type]) -> Option<usize> {
+    let mut type_stack = Vec::new();
+    calculate_field_total_size_inner(field, types, &mut type_stack)
+}
+
+fn calculate_field_total_size_inner(
+    field: &crate::vm2::TypeField,
+    types: &[Type],
+    type_stack: &mut Vec<usize>,
+) -> Option<usize> {
     let base_size = match &field.kind {
-        TypeFieldKind::Ff => 1,
+        TypeFieldKind::Ff => Some(1),
         TypeFieldKind::Bus(bus_idx) => {
-            let bus_type = &types[*bus_idx];
-            calculate_bus_total_size(bus_type, types)
+            calculate_bus_total_size_inner(*bus_idx, types, type_stack)
         }
-    };
+    }?;
 
     if field.dims.is_empty() {
-        base_size
+        Some(base_size)
     } else {
-        base_size * field.dims.iter().product::<usize>()
+        let dim_product = field.dims.iter().try_fold(1usize, |acc, dim| {
+            acc.checked_mul(*dim)
+        })?;
+        base_size.checked_mul(dim_product)
     }
 }
 
-/// Calculate the total size of a bus type
-fn calculate_bus_total_size(bus_type: &Type, types: &[Type]) -> usize {
-    bus_type.fields.iter()
-        .map(|f| calculate_field_total_size(f, types))
-        .sum()
+/// Calculate the total size of the bus type at `bus_idx`, rejecting recursive
+/// bus definitions (returns `None`).
+fn calculate_bus_total_size(bus_idx: usize, types: &[Type]) -> Option<usize> {
+    let mut type_stack = Vec::new();
+    calculate_bus_total_size_inner(bus_idx, types, &mut type_stack)
+}
+
+fn calculate_bus_total_size_inner(
+    bus_idx: usize,
+    types: &[Type],
+    type_stack: &mut Vec<usize>,
+) -> Option<usize> {
+    if type_stack.contains(&bus_idx) {
+        return None;
+    }
+    type_stack.push(bus_idx);
+    let bus_type = types.get(bus_idx)?;
+    let total = bus_type.fields.iter().try_fold(0usize, |acc, field| {
+        let field_size = calculate_field_total_size_inner(field, types, type_stack)?;
+        acc.checked_add(field_size)
+    });
+    type_stack.pop();
+    total
 }
 
 /// Build the component tree for VM2 execution
 pub fn build_component_tree<T: FieldOps>(
-    main_template_id: usize, vm_templates: &[Template]) -> Component<T> {
+    main_template_id: usize, vm_templates: &[Template]) -> Result<Component<T>, Box<dyn Error>> {
 
-    create_component(main_template_id, 1, vm_templates).0
+    let mut stack = Vec::new();
+    Ok(create_component(main_template_id, 1, vm_templates, &mut stack)?.0)
 }
 
 /// Create a component tree and returns the component and the number of signals
 /// of self and all its children
 fn create_component<T: FieldOps>(
     template_id: usize,
-    signals_start: usize, vm_templates: &[Template]) -> (Component<T>, usize) {
+    signals_start: usize,
+    vm_templates: &[Template],
+    template_stack: &mut Vec<usize>,
+) -> Result<(Component<T>, usize), Box<dyn Error>> {
 
-    let t = &vm_templates[template_id];
-    let mut next_signal_start = signals_start + t.signals_num;
-    let mut components = Vec::with_capacity(t.components.len());
+    if template_stack.contains(&template_id) {
+        return Err(setup_error("component template cycle detected"));
+    }
+    template_stack.push(template_id);
+    let t = vm_templates.get(template_id)
+        .ok_or_else(|| setup_error("template id outside template range"))?;
+    let mut next_signal_start = signals_start.checked_add(t.signals_num)
+        .ok_or_else(|| setup_error("component signal range overflows"))?;
+    let mut components = Vec::new();
+    components.try_reserve(t.components.len())
+        .map_err(|_| setup_error("component allocation failed"))?;
     for cmp_tmpl_id in t.components.iter() {
         components.push(match cmp_tmpl_id {
             None => None,
             Some( tmpl_id ) => {
                 let (c, signals_num) = create_component(
-                    *tmpl_id, next_signal_start, vm_templates);
-                next_signal_start += signals_num;
+                    *tmpl_id, next_signal_start, vm_templates, template_stack)?;
+                next_signal_start = next_signal_start.checked_add(signals_num)
+                    .ok_or_else(|| setup_error("component signal range overflows"))?;
                 Some(Arc::new(RwLock::new(c)))
             }
         });
     }
-    (
-        Component::new(
+    let total_signals = next_signal_start.checked_sub(signals_start)
+        .ok_or_else(|| setup_error("component signal range outside parent"))?;
+    let component = Component::try_new(
             signals_start,
             template_id,
             components,
             t.number_of_inputs,
-            t.signals_num),
-        next_signal_start - signals_start
-    )
+            t.signals_num)?;
+    template_stack.pop();
+    Ok((component, total_signals))
 }
 
 fn parse_signals_json<T: FieldOps, F>(
@@ -616,7 +689,7 @@ mod tests {
             template7];
 
         // Build component tree with template7 (Root) as the main template
-        let component_tree: Component<U254> = build_component_tree(6, &vm_templates);
+        let component_tree: Component<U254> = build_component_tree(6, &vm_templates).unwrap();
 
         // Verify the structure of the root component
         assert_eq!(component_tree.signals_start, 1);
@@ -974,6 +1047,84 @@ mod tests {
         assert_eq!(path_to_signal_idx("[0]", &input_infos, &types), Some(7));
         assert_eq!(path_to_signal_idx("[12]", &input_infos, &types), Some(19));
         assert_eq!(path_to_signal_idx("[38]", &input_infos, &types), Some(45));
+    }
+
+    #[test]
+    fn test_path_to_signal_idx_rejects_overflowing_flat_size() {
+        let input_infos = vec![InputInfo {
+            name: "a".to_string(),
+            offset: 0,
+            lengths: vec![usize::MAX, 2],
+            type_id: None,
+        }];
+
+        assert_eq!(path_to_signal_idx("a[0]", &input_infos, &[]), None);
+    }
+
+    #[test]
+    fn test_path_to_signal_idx_rejects_recursive_bus_type() {
+        use crate::vm2::{Type, TypeField, TypeFieldKind};
+
+        let types = vec![Type {
+            name: "bus_0".to_string(),
+            fields: vec![TypeField {
+                name: "self".to_string(),
+                kind: TypeFieldKind::Bus(0),
+                offset: 0,
+                base_type_size: 1,
+                dims: vec![],
+            }],
+        }];
+        let input_infos = vec![InputInfo {
+            name: "a".to_string(),
+            offset: 0,
+            lengths: vec![1],
+            type_id: Some("bus_0".to_string()),
+        }];
+
+        assert_eq!(path_to_signal_idx("a[0]", &input_infos, &types), None);
+    }
+
+    #[test]
+    fn test_build_component_tree_rejects_invalid_template_id() {
+        let template = Template {
+            name: "Root".to_string(),
+            code: vec![],
+            signals_num: 1,
+            number_of_inputs: 0,
+            components: vec![Some(1)],
+            inputs: vec![],
+            outputs: vec![],
+            ff_variable_names: vec![],
+            i64_variable_names: vec![],
+        };
+
+        let err = match build_component_tree::<U254>(0, &[template]) {
+            Ok(_) => panic!("expected invalid template id to fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("template range"));
+    }
+
+    #[test]
+    fn test_build_component_tree_rejects_template_cycles() {
+        let template = Template {
+            name: "Root".to_string(),
+            code: vec![],
+            signals_num: 1,
+            number_of_inputs: 0,
+            components: vec![Some(0)],
+            inputs: vec![],
+            outputs: vec![],
+            ff_variable_names: vec![],
+            i64_variable_names: vec![],
+        };
+
+        let err = match build_component_tree::<U254>(0, &[template]) {
+            Ok(_) => panic!("expected template cycle to fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("cycle"));
     }
 
     include!("vm2_setup_tests.rs");

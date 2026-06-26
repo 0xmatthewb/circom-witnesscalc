@@ -509,7 +509,7 @@ pub fn calculate_witness_vm2<T: FieldOps>(
     mut w: impl std::io::Write) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut component_tree = build_component_tree(
-        circuit.main_template_id, &circuit.templates);
+        circuit.main_template_id, &circuit.templates)?;
 
     init_signals(
         inputs_json, &circuit.field, &circuit.types, &circuit.input_infos,

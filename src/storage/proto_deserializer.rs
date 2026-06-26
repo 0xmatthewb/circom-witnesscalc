@@ -327,7 +327,7 @@ fn decode_input_node<T: FieldOps + 'static, NS: NodesStorage + 'static>(
     Ok(())
 }
 
-fn decode_big_le_bytes(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+fn decode_big_le_bytes(bytes: &[u8]) -> Result<&[u8], Error> {
     if bytes.is_empty() {
         return Err(Error::new(
             ErrorKind::UnexpectedEof,
@@ -359,7 +359,7 @@ fn decode_big_le_bytes(bytes: &[u8]) -> Result<Vec<u8>, Error> {
         ));
     }
     let bytes = &bytes[varint_size..];
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 /// Decodes a UnoOpNode message into an Operation and two indices
@@ -589,10 +589,10 @@ fn decode_constant_node<T: FieldOps + 'static, NS: NodesStorage + 'static>(
     }
 
     let n = decode_big_le_bytes(bytes)?;
-    let v = (&nodes.ff).parse_le_bytes(&n).map_err(|_| {
+    let v = (&nodes.ff).parse_le_bytes(n).map_err(|_| {
         Error::new(ErrorKind::InvalidData, "Invalid BigInt bytes")
     })?;
-    nodes.const_node_idx_from_value(v);
+    nodes.try_const_node_idx_from_value(v)?;
     Ok(())
 }
 

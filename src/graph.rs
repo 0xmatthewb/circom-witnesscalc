@@ -651,6 +651,19 @@ impl<T: FieldOps + 'static, NS: NodesStorage + 'static> Nodes<T, NS> {
         }
     }
 
+    pub(crate) fn try_const_node_idx_from_value(&mut self, v: T) -> std::io::Result<usize> {
+        if let Some(idx) = self.constants_idx.get(&v) {
+            return Ok(*idx);
+        }
+        self.constants
+            .try_reserve(1)
+            .map_err(|_| invalid_graph_data("graph constants allocation failed"))?;
+        self.constants_idx
+            .try_reserve(1)
+            .map_err(|_| invalid_graph_data("graph constant index allocation failed"))?;
+        Ok(self.const_node_idx_from_value(v))
+    }
+
     pub fn to_const_recursive(&self, idx: NodeIdx) -> Result<T, NodeConstErr> {
         let me = self.nodes.get(idx.0).ok_or(NodeConstErr::EmptyNode(idx))?;
         match me {

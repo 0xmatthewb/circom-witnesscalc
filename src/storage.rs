@@ -40,7 +40,9 @@ fn read_signal<R: Read>(r: &mut R) -> std::io::Result<vm2::Signal> {
         0 => {
             // Ff signal
             let num_dims = r.read_u32::<LittleEndian>()? as usize;
-            let mut dims = Vec::with_capacity(num_dims);
+            let mut dims = Vec::new();
+            dims.try_reserve(num_dims)
+                .map_err(|_| invalid_data("signal dimensions allocation failed"))?;
             for _ in 0..num_dims {
                 dims.push(r.read_u32::<LittleEndian>()? as usize);
             }
@@ -50,7 +52,9 @@ fn read_signal<R: Read>(r: &mut R) -> std::io::Result<vm2::Signal> {
             // Bus signal
             let type_idx = r.read_u32::<LittleEndian>()? as usize;
             let num_dims = r.read_u32::<LittleEndian>()? as usize;
-            let mut dims = Vec::with_capacity(num_dims);
+            let mut dims = Vec::new();
+            dims.try_reserve(num_dims)
+                .map_err(|_| invalid_data("signal dimensions allocation failed"))?;
             for _ in 0..num_dims {
                 dims.push(r.read_u32::<LittleEndian>()? as usize);
             }
@@ -86,17 +90,34 @@ fn read_string_vec<R: Read>(r: &mut R) -> std::io::Result<Vec<String>> {
     let total_bytes = r.read_u32::<LittleEndian>()?;
     let count = r.read_u32::<LittleEndian>()? as usize;
 
-    let mut vec = Vec::with_capacity(count);
-    let mut bytes_read = 4u32; // count field
+    let min_entry_bytes = checked_count_bytes(count, 4, "variable names")?;
+    let min_total = checked_sum(4, min_entry_bytes, "variable names")?;
+    if min_total > total_bytes as usize {
+        return Err(invalid_data(format!(
+            "Variable names data corruption: expected {} bytes, minimum {} bytes",
+            total_bytes, min_total,
+        )));
+    }
+
+    let mut vec = Vec::new();
+    vec.try_reserve(count)
+        .map_err(|_| invalid_data("variable names allocation failed"))?;
+    let mut bytes_read = 4usize; // count field
 
     for _ in 0..count {
         let value_len = r.read_u32::<LittleEndian>()? as usize;
-        bytes_read += 4;
+        bytes_read = checked_sum(bytes_read, 4, "variable names")?;
 
         if value_len > 0 {
-            let mut value_bytes = vec![0u8; value_len];
-            r.read_exact(&mut value_bytes)?;
-            bytes_read += value_len as u32;
+            let end = checked_sum(bytes_read, value_len, "variable names")?;
+            if end > total_bytes as usize {
+                return Err(invalid_data(format!(
+                    "Variable names data corruption: expected {} bytes, read {} bytes",
+                    total_bytes, end,
+                )));
+            }
+            let value_bytes = read_exact_vec(r, value_len, "variable name")?;
+            bytes_read = end;
 
             let value = String::from_utf8(value_bytes)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
@@ -108,7 +129,7 @@ fn read_string_vec<R: Read>(r: &mut R) -> std::io::Result<Vec<String>> {
     }
 
     // Validate that we read exactly total_bytes
-    if bytes_read != total_bytes {
+    if bytes_read != total_bytes as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("Variable names data corruption: expected {} bytes, read {} bytes",
@@ -134,6 +155,39 @@ const WITNESSCALC_VM_MAGIC: &[u8] = b"wtns.vm.001";
 pub(crate) const WITNESSCALC_CVM_MAGIC: &[u8] = b"wtns.cvm.001";
 
 const MAX_VARINT_LENGTH: usize = 10;
+
+fn invalid_data(msg: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidData, msg.into())
+}
+
+fn checked_count_bytes(count: usize, width: usize, what: &str) -> std::io::Result<usize> {
+    count.checked_mul(width)
+        .ok_or_else(|| invalid_data(format!("{} byte count overflows", what)))
+}
+
+fn checked_sum(a: usize, b: usize, what: &str) -> std::io::Result<usize> {
+    a.checked_add(b)
+        .ok_or_else(|| invalid_data(format!("{} range overflows", what)))
+}
+
+fn read_exact_vec<R: Read>(
+    r: &mut R,
+    len: usize,
+    what: &str,
+) -> std::io::Result<Vec<u8>> {
+    let limit = u64::try_from(len)
+        .map_err(|_| invalid_data(format!("{} range exceeds artifact length", what)))?;
+    let mut buf = Vec::new();
+    let mut limited = r.by_ref().take(limit);
+    limited.read_to_end(&mut buf)?;
+    if buf.len() != len {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            format!("{} range exceeds artifact length", what),
+        ));
+    }
+    Ok(buf)
+}
 
 impl From<crate::proto::UnoOp> for UnoOperation {
     fn from(value: crate::proto::UnoOp) -> Self {
@@ -393,12 +447,7 @@ fn read_message_length<R: Read>(rw: &mut WriteBackReader<R>) -> std::io::Result<
 
 fn read_message<R: Read, M: Message + Default>(rw: &mut WriteBackReader<R>) -> std::io::Result<M> {
     let ln = read_message_length(rw)?;
-    let mut buf = vec![0u8; ln];
-    let bytes_read = rw.read(&mut buf)?;
-    if bytes_read != ln {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof, "Unexpected EOF"));
-    }
+    let buf = read_exact_vec(rw, ln, "protobuf message")?;
 
     let msg = prost::Message::decode(&buf[..])?;
 
@@ -421,19 +470,27 @@ pub fn deserialize_witnesscalc_vm(
 
     let md: crate::proto::vm::VmMd = read_message(&mut br)?;
 
-    let mut templates: Vec<Template> = Vec::with_capacity(md.templates_num as usize);
+    let mut templates: Vec<Template> = Vec::new();
+    templates.try_reserve(md.templates_num as usize)
+        .map_err(|_| invalid_data("templates allocation failed"))?;
     for _ in 0..md.templates_num {
         let tmpl: crate::proto::vm::Template = read_message(&mut br)?;
-        templates.push(Template::try_from(&tmpl).unwrap());
+        templates.push(Template::try_from(&tmpl)
+            .map_err(|e| invalid_data(e.to_string()))?);
     }
 
-    let mut functions: Vec<Function> = Vec::with_capacity(md.functions_num as usize);
+    let mut functions: Vec<Function> = Vec::new();
+    functions.try_reserve(md.functions_num as usize)
+        .map_err(|_| invalid_data("functions allocation failed"))?;
     for _ in 0..md.functions_num {
         let func: crate::proto::vm::Function = read_message(&mut br)?;
-        functions.push(Function::try_from(&func).unwrap());
+        functions.push(Function::try_from(&func)
+            .map_err(|e| invalid_data(e.to_string()))?);
     }
 
-    let mut constants = Vec::with_capacity(md.constants_num as usize);
+    let mut constants = Vec::new();
+    constants.try_reserve(md.constants_num as usize)
+        .map_err(|_| invalid_data("constants allocation failed"))?;
     for _ in 0 .. md.constants_num {
         let mut buf = [0u8; 32];
         br.read_exact(&mut buf)?;
@@ -546,26 +603,45 @@ pub fn init_input_signals(
     inputs_desc: &InputList,
     inputs: &HashMap<String, Vec<U256>>,
     signals: &mut [Option<U256>],
-) {
-    signals[0] = Some(U256::from(1u64));
+) -> std::io::Result<()> {
+    let one_signal = signals
+        .get_mut(0)
+        .ok_or_else(|| invalid_data("signal range is empty"))?;
+    *one_signal = Some(U256::from(1u64));
 
     for (name, offset, len) in inputs_desc {
         match inputs.get(name) {
             Some(values) => {
                 if values.len() != *len {
-                    panic!(
+                    return Err(invalid_data(format!(
                         "input signal {} has different length in inputs file, want {}, actual {}",
-                        name, len, values.len());
+                        name, len, values.len(),
+                    )));
                 }
                 for (i, v) in values.iter().enumerate() {
-                    signals[*offset + i] = Some(*v);
+                    let signal_idx = offset
+                        .checked_add(i)
+                        .ok_or_else(|| invalid_data("input signal range overflows"))?;
+                    let signals_len = signals.len();
+                    let slot = signals.get_mut(signal_idx).ok_or_else(|| {
+                        invalid_data(format!(
+                            "input signal range outside signal range: index {}, signals {}",
+                            signal_idx, signals_len,
+                        ))
+                    })?;
+                    *slot = Some(*v);
                 }
             }
             None => {
-                panic!("input signal {} is not found in inputs file", name);
+                return Err(invalid_data(format!(
+                    "input signal {} is not found in inputs file",
+                    name,
+                )));
             }
         }
     }
+
+    Ok(())
 }
 
 pub fn serialize_input_infos<W: Write>(
@@ -643,19 +719,22 @@ pub fn serialize_input_signal_info(
 
 pub fn deserialize_input_infos<R: Read>(r: &mut R) -> std::io::Result<Vec<vm2::InputInfo>> {
     let num_input_infos = r.read_u32::<LittleEndian>()? as usize;
-    let mut input_infos = Vec::with_capacity(num_input_infos);
+    let mut input_infos = Vec::new();
+    input_infos.try_reserve(num_input_infos)
+        .map_err(|_| invalid_data("input infos allocation failed"))?;
 
     for _ in 0..num_input_infos {
         let name_len = r.read_u32::<LittleEndian>()? as usize;
-        let mut name_bytes = vec![0u8; name_len];
-        r.read_exact(&mut name_bytes)?;
+        let name_bytes = read_exact_vec(r, name_len, "input name")?;
         let name = String::from_utf8(name_bytes)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in input name"))?;
 
         let offset = r.read_u32::<LittleEndian>()? as usize;
 
         let num_lengths = r.read_u32::<LittleEndian>()? as usize;
-        let mut lengths = Vec::with_capacity(num_lengths);
+        let mut lengths = Vec::new();
+        lengths.try_reserve(num_lengths)
+            .map_err(|_| invalid_data("input lengths allocation failed"))?;
         for _ in 0..num_lengths {
             lengths.push(r.read_u32::<LittleEndian>()? as usize);
         }
@@ -663,8 +742,7 @@ pub fn deserialize_input_infos<R: Read>(r: &mut R) -> std::io::Result<Vec<vm2::I
         let has_type_id = r.read_u8()?;
         let type_id = if has_type_id == 1 {
             let type_id_len = r.read_u32::<LittleEndian>()? as usize;
-            let mut type_id_bytes = vec![0u8; type_id_len];
-            r.read_exact(&mut type_id_bytes)?;
+            let type_id_bytes = read_exact_vec(r, type_id_len, "type id")?;
             Some(String::from_utf8(type_id_bytes)
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in type_id"))?)
         } else {
@@ -684,22 +762,24 @@ pub fn deserialize_input_infos<R: Read>(r: &mut R) -> std::io::Result<Vec<vm2::I
 
 pub fn deserialize_types<R: Read>(r: &mut R) -> std::io::Result<Vec<vm2::Type>> {
     let num_types = r.read_u32::<LittleEndian>()? as usize;
-    let mut types = Vec::with_capacity(num_types);
+    let mut types = Vec::new();
+    types.try_reserve(num_types)
+        .map_err(|_| invalid_data("types allocation failed"))?;
 
     for _ in 0..num_types {
         let name_len = r.read_u32::<LittleEndian>()? as usize;
-        let mut name_bytes = vec![0u8; name_len];
-        r.read_exact(&mut name_bytes)?;
+        let name_bytes = read_exact_vec(r, name_len, "type name")?;
         let name = String::from_utf8(name_bytes)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in type name"))?;
 
         let num_fields = r.read_u32::<LittleEndian>()? as usize;
-        let mut fields = Vec::with_capacity(num_fields);
+        let mut fields = Vec::new();
+        fields.try_reserve(num_fields)
+            .map_err(|_| invalid_data("type fields allocation failed"))?;
 
         for _ in 0..num_fields {
             let field_name_len = r.read_u32::<LittleEndian>()? as usize;
-            let mut field_name_bytes = vec![0u8; field_name_len];
-            r.read_exact(&mut field_name_bytes)?;
+            let field_name_bytes = read_exact_vec(r, field_name_len, "field name")?;
             let field_name = String::from_utf8(field_name_bytes)
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in field name"))?;
 
@@ -717,7 +797,9 @@ pub fn deserialize_types<R: Read>(r: &mut R) -> std::io::Result<Vec<vm2::Type>> 
             let base_type_size = r.read_u32::<LittleEndian>()? as usize;
 
             let num_dims = r.read_u32::<LittleEndian>()? as usize;
-            let mut dims = Vec::with_capacity(num_dims);
+            let mut dims = Vec::new();
+            dims.try_reserve(num_dims)
+                .map_err(|_| invalid_data("type field dimensions allocation failed"))?;
             for _ in 0..num_dims {
                 dims.push(r.read_u32::<LittleEndian>()? as usize);
             }
@@ -855,8 +937,7 @@ pub fn read_witnesscalc_vm2_header(
 
     // Read field (prime) - first read the length, then the bytes
     let prime_len = r.read_u8()? as usize;
-    let mut prime_bytes = vec![0u8; prime_len];
-    r.read_exact(&mut prime_bytes)?;
+    let prime_bytes = read_exact_vec(&mut r, prime_len, "prime")?;
 
     Ok(BigUint::from_bytes_le(&prime_bytes))
 }
@@ -869,20 +950,20 @@ pub fn deserialize_witnesscalc_vm2_body<T: FieldOps>(
 
     // Read templates
     let num_templates = r.read_u32::<LittleEndian>()? as usize;
-    let mut templates = Vec::with_capacity(num_templates);
+    let mut templates = Vec::new();
+    templates.try_reserve(num_templates)
+        .map_err(|_| invalid_data("templates allocation failed"))?;
 
     for _ in 0..num_templates {
         // Read template name
         let name_len = r.read_u32::<LittleEndian>()? as usize;
-        let mut name_bytes = vec![0u8; name_len];
-        r.read_exact(&mut name_bytes)?;
+        let name_bytes = read_exact_vec(&mut r, name_len, "template name")?;
         let name = String::from_utf8(name_bytes)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in template name"))?;
 
         // Read code
         let code_len = r.read_u32::<LittleEndian>()? as usize;
-        let mut code = vec![0u8; code_len];
-        r.read_exact(&mut code)?;
+        let code = read_exact_vec(&mut r, code_len, "template code")?;
 
         // Read template metadata
         let signals_num = r.read_u32::<LittleEndian>()? as usize;
@@ -890,7 +971,9 @@ pub fn deserialize_witnesscalc_vm2_body<T: FieldOps>(
 
         // Read components
         let num_components = r.read_u32::<LittleEndian>()? as usize;
-        let mut components = Vec::with_capacity(num_components);
+        let mut components = Vec::new();
+        components.try_reserve(num_components)
+            .map_err(|_| invalid_data("template components allocation failed"))?;
         for _ in 0..num_components {
             let has_value = r.read_u8()?;
             if has_value == 1 {
@@ -902,13 +985,17 @@ pub fn deserialize_witnesscalc_vm2_body<T: FieldOps>(
         }
 
         let num_inputs = r.read_u32::<LittleEndian>()? as usize;
-        let mut inputs = Vec::with_capacity(num_inputs);
+        let mut inputs = Vec::new();
+        inputs.try_reserve(num_inputs)
+            .map_err(|_| invalid_data("template inputs allocation failed"))?;
         for _ in 0..num_inputs {
             inputs.push(read_signal(&mut r)?);
         }
         
         let num_outputs = r.read_u32::<LittleEndian>()? as usize;
-        let mut outputs = Vec::with_capacity(num_outputs);
+        let mut outputs = Vec::new();
+        outputs.try_reserve(num_outputs)
+            .map_err(|_| invalid_data("template outputs allocation failed"))?;
         for _ in 0..num_outputs {
             outputs.push(read_signal(&mut r)?);
         }
@@ -932,14 +1019,17 @@ pub fn deserialize_witnesscalc_vm2_body<T: FieldOps>(
 
     // Read functions
     let num_functions = r.read_u32::<LittleEndian>()? as usize;
-    let mut functions = Vec::with_capacity(num_functions);
+    let mut functions = Vec::new();
+    functions.try_reserve(num_functions)
+        .map_err(|_| invalid_data("functions allocation failed"))?;
     let mut function_registry = HashMap::new();
+    function_registry.try_reserve(num_functions)
+        .map_err(|_| invalid_data("function registry allocation failed"))?;
 
     for idx in 0..num_functions {
         // Read function name
         let name_len = r.read_u32::<LittleEndian>()? as usize;
-        let mut name_bytes = vec![0u8; name_len];
-        r.read_exact(&mut name_bytes)?;
+        let name_bytes = read_exact_vec(&mut r, name_len, "function name")?;
         let name = String::from_utf8(name_bytes)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in function name"))?;
 
@@ -948,8 +1038,7 @@ pub fn deserialize_witnesscalc_vm2_body<T: FieldOps>(
 
         // Read code
         let code_len = r.read_u32::<LittleEndian>()? as usize;
-        let mut code = vec![0u8; code_len];
-        r.read_exact(&mut code)?;
+        let code = read_exact_vec(&mut r, code_len, "function code")?;
 
         // Read variable name maps
         let ff_variable_names = read_string_vec(&mut r)?;
@@ -965,7 +1054,9 @@ pub fn deserialize_witnesscalc_vm2_body<T: FieldOps>(
 
     // Read witness
     let num_witness = r.read_u32::<LittleEndian>()? as usize;
-    let mut witness = Vec::with_capacity(num_witness);
+    let mut witness = Vec::new();
+    witness.try_reserve(num_witness)
+        .map_err(|_| invalid_data("witness allocation failed"))?;
     for _ in 0..num_witness {
         witness.push(r.read_u32::<LittleEndian>()? as usize);
     }
@@ -1027,6 +1118,111 @@ mod tests {
         assert!(n2.eq(&got_n2));
 
         assert_eq!(reader.position(), buf.len() as u64);
+    }
+
+    #[test]
+    fn test_init_input_signals_rejects_out_of_range_offset() {
+        let inputs_desc = vec![("in".to_string(), 1, 1)];
+        let mut inputs = HashMap::new();
+        inputs.insert("in".to_string(), vec![U256::from(3u64)]);
+        let mut signals = vec![None];
+
+        let err = init_input_signals(&inputs_desc, &inputs, &mut signals).unwrap_err();
+
+        assert!(err.to_string().contains("outside signal range"));
+    }
+
+    #[test]
+    fn test_read_string_vec_rejects_count_exceeding_payload() {
+        // A huge declared count with a tiny total_bytes must be rejected before
+        // a count-sized allocation is attempted.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&4u32.to_le_bytes()); // total_bytes (only the count field)
+        buf.extend_from_slice(&1_000_000u32.to_le_bytes()); // count
+
+        let err = read_string_vec(&mut std::io::Cursor::new(buf)).unwrap_err();
+
+        assert!(err.to_string().contains("data corruption"));
+    }
+
+    #[test]
+    fn test_graph_metadata_pointer_outside_artifact_returns_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(WITNESSCALC_GRAPH_MAGIC_001);
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&u64::MAX.to_le_bytes());
+
+        let err = deserialize_witnesscalc_graph_from_bytes(&buf).err().unwrap();
+        assert!(err.to_string().contains("metadata range exceeds"));
+    }
+
+    #[test]
+    fn test_graph_metadata_pointer_before_node_section_returns_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(WITNESSCALC_GRAPH_MAGIC_001);
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+
+        let err = deserialize_witnesscalc_graph_from_bytes(&buf).err().unwrap();
+        assert!(err.to_string().contains("precedes node section"));
+    }
+
+    #[test]
+    fn test_graph_node_count_exceeds_node_section_returns_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(WITNESSCALC_GRAPH_MAGIC_001);
+        buf.extend_from_slice(&2u64.to_le_bytes());
+
+        let metadata_start = buf.len();
+        let metadata = crate::proto::GraphMetadata {
+            witness_signals: vec![],
+            inputs: HashMap::new(),
+            prime: None,
+            prime_str: String::new(),
+            input_signal_info: vec![],
+        };
+        metadata.encode_length_delimited(&mut buf).unwrap();
+        buf.extend_from_slice(&(metadata_start as u64).to_le_bytes());
+
+        let err = deserialize_witnesscalc_graph_from_bytes(&buf).err().unwrap();
+        assert!(err.to_string().contains("node section shorter"));
+    }
+
+    #[test]
+    fn test_graph_node_range_exceeds_artifact_returns_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(WITNESSCALC_GRAPH_MAGIC_001);
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
+
+        let metadata_start = buf.len();
+        let metadata = crate::proto::GraphMetadata {
+            witness_signals: vec![],
+            inputs: HashMap::new(),
+            prime: None,
+            prime_str: String::new(),
+            input_signal_info: vec![],
+        };
+        metadata.encode_length_delimited(&mut buf).unwrap();
+        buf.extend_from_slice(&(metadata_start as u64).to_le_bytes());
+
+        let err = deserialize_witnesscalc_graph_from_bytes(&buf).err().unwrap();
+        assert!(err.to_string().contains("node message range"));
+    }
+
+    #[test]
+    fn test_vm2_template_code_range_exceeds_artifact_returns_error() {
+        let ff = Field::new(bn254_prime);
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // main_template_id
+        body.extend_from_slice(&1u32.to_le_bytes()); // num_templates
+        body.extend_from_slice(&4u32.to_le_bytes()); // template name length
+        body.extend_from_slice(b"main");
+        body.extend_from_slice(&u32::MAX.to_le_bytes()); // impossible code length
+
+        let err = deserialize_witnesscalc_vm2_body(std::io::Cursor::new(body), ff)
+            .err().unwrap();
+        assert!(err.to_string().contains("template code range exceeds"));
     }
 
     #[test]

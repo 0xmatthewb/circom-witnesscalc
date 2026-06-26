@@ -581,6 +581,13 @@ impl VecNodes {
             nodes: Vec::new(),
         }
     }
+
+    pub(crate) fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.nodes.try_reserve(additional)
+    }
 }
 
 impl Default for VecNodes {

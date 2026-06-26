@@ -14,6 +14,74 @@ pub enum InputInfo {
     },
 }
 
+fn checked_end(start: usize, len: usize, what: &str) -> std::io::Result<usize> {
+    start.checked_add(len).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("{} range overflows", what),
+        )
+    })
+}
+
+fn checked_range<'a>(
+    bytes: &'a [u8],
+    start: usize,
+    len: usize,
+    what: &str,
+) -> std::io::Result<&'a [u8]> {
+    let end = checked_end(start, len, what)?;
+    if end > bytes.len() {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            format!("{} range exceeds artifact length", what),
+        ));
+    }
+    Ok(&bytes[start..end])
+}
+
+fn checked_suffix<'a>(bytes: &'a [u8], len: usize, what: &str) -> std::io::Result<&'a [u8]> {
+    if len > bytes.len() {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            format!("{} range exceeds artifact length", what),
+        ));
+    }
+    Ok(&bytes[bytes.len() - len..])
+}
+
+fn checked_usize<T>(value: T, what: &str) -> std::io::Result<usize>
+where
+    usize: TryFrom<T>,
+{
+    usize::try_from(value).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("{} exceeds platform size", what),
+        )
+    })
+}
+
+fn decode_nodes<T: FieldOps + 'static, NS: NodesStorage + 'static>(
+    bytes: &[u8],
+    mut idx: usize,
+    nodes_num: u64,
+    nodes: &mut Nodes<T, NS>,
+) -> std::io::Result<()> {
+    for _ in 0..nodes_num {
+        let (msg_len, int_len) = decode_varint_u32(checked_range(
+            bytes,
+            idx,
+            bytes.len().saturating_sub(idx),
+            "node message length",
+        )?)?;
+        idx = checked_end(idx, int_len, "node message length")?;
+        let node_bytes = checked_range(bytes, idx, msg_len as usize, "node message")?;
+        decode_node(node_bytes, nodes)?;
+        idx = checked_end(idx, msg_len as usize, "node message")?;
+    }
+    Ok(())
+}
+
 // deserialize_witnesscalc_graph_from_bytes is almost the same as
 // deserialize_witnesscalc_graph but with custom implemented protobuf parser
 // specifically optimized to unpack the list of Nodes.
@@ -29,57 +97,86 @@ pub fn deserialize_witnesscalc_graph_from_bytes(
         return Err(Error::other("Invalid magic"));
     };
 
-    let nodes_num = u64::from_le_bytes(bytes[idx..idx+8].try_into().unwrap());
+    let nodes_num = u64::from_le_bytes(
+        checked_range(bytes, idx, 8, "node count")?.try_into().unwrap());
     idx += 8;
 
-    let vm_ptr = u64::from_le_bytes(bytes[bytes.len() - 8..bytes.len()]
-        .try_into().unwrap());
-    let r = Cursor::new(&bytes[vm_ptr as usize..]);
+    let vm_ptr = u64::from_le_bytes(
+        checked_suffix(bytes, 8, "metadata pointer")?.try_into().unwrap());
+    let vm_ptr = usize::try_from(vm_ptr).map_err(|_| {
+        Error::new(ErrorKind::InvalidData, "metadata range exceeds artifact length")
+    })?;
+    let metadata_end = bytes.len().checked_sub(8).ok_or_else(|| {
+        Error::new(ErrorKind::UnexpectedEof, "metadata pointer range exceeds artifact length")
+    })?;
+    if vm_ptr > metadata_end {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "metadata range exceeds artifact length",
+        ));
+    }
+    if vm_ptr < idx {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "metadata pointer precedes node section",
+        ));
+    }
+    let nodes_len = checked_usize(nodes_num, "node count")?;
+    let node_data_len = vm_ptr - idx;
+    if nodes_len > node_data_len {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "node section shorter than node count",
+        ));
+    }
+    let r = Cursor::new(checked_range(
+        bytes,
+        vm_ptr,
+        metadata_end - vm_ptr,
+        "metadata",
+    )?);
     let mut br = WriteBackReader::new(r);
     let md: crate::proto::GraphMetadata = read_message(&mut br)?;
 
-    let (prime, curve_name) = if md.prime.is_none() {
+    let (prime, curve_name) = if let Some(prime) = md.prime {
+        (
+            <U254 as FieldOps>::from_le_bytes(prime.value_le.as_slice())
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid prime bytes"))?,
+            md.prime_str.as_str()
+        )
+    } else {
         (
             U254::from_str(
                 "21888242871839275222246405745257275088548364400416034343698204186575808495617")
                 .unwrap(),
             "bn128"
         )
-    } else {
-        (
-            <U254 as FieldOps>::from_le_bytes(
-                md.prime.unwrap().value_le.as_slice())
-                .unwrap(),
-            md.prime_str.as_str()
-        )
     };
+
+    let node_section = checked_range(bytes, 0, vm_ptr, "node section")?;
 
     let outer_nodes: Box<dyn NodesInterface> = match prime.bit_len() {
         64 => {
             let prime = U64::from_le_bytes(
                 &<U254 as FieldOps>::to_le_bytes(&prime))
-                .unwrap();
-            let node_storage = VecNodes::new();
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid prime bytes"))?;
+            let mut node_storage = VecNodes::new();
+            node_storage.try_reserve(nodes_len).map_err(|_| {
+                Error::new(ErrorKind::InvalidData, "nodes allocation failed")
+            })?;
             let mut nodes = Nodes::new(
                 prime, curve_name, node_storage);
-            for _ in 0..nodes_num {
-                let (msg_len, int_len) = decode_varint_u32(&bytes[idx..])?;
-                idx += int_len;
-                decode_node(&bytes[idx..idx+msg_len as usize], &mut nodes)?;
-                idx += msg_len as usize;
-            }
+            decode_nodes(node_section, idx, nodes_num, &mut nodes)?;
             Box::new(nodes)
         }
         254 => {
-            let node_storage = VecNodes::new();
+            let mut node_storage = VecNodes::new();
+            node_storage.try_reserve(nodes_len).map_err(|_| {
+                Error::new(ErrorKind::InvalidData, "nodes allocation failed")
+            })?;
             let mut nodes = Nodes::new(
                 prime, curve_name, node_storage);
-            for _ in 0..nodes_num {
-                let (msg_len, int_len) = decode_varint_u32(&bytes[idx..])?;
-                idx += int_len;
-                decode_node(&bytes[idx..idx+msg_len as usize], &mut nodes)?;
-                idx += msg_len as usize;
-            }
+            decode_nodes(node_section, idx, nodes_num, &mut nodes)?;
             Box::new(nodes)
         }
         _ => {
@@ -89,17 +186,29 @@ pub fn deserialize_witnesscalc_graph_from_bytes(
         }
     };
 
-    let witness_signals = md.witness_signals
-        .iter()
-        .map(|x| *x as usize)
-        .collect::<Vec<usize>>();
+    let mut witness_signals = Vec::new();
+    witness_signals.try_reserve(md.witness_signals.len()).map_err(|_| {
+        Error::new(ErrorKind::InvalidData, "witness signal allocation failed")
+    })?;
+    for idx in md.witness_signals {
+        witness_signals.push(checked_usize(idx, "witness signal index")?);
+    }
 
     let inputs_info = if bytes.starts_with(WITNESSCALC_GRAPH_MAGIC_001) {
-        InputInfo::V1(md.inputs.iter()
-            .map(|(k, v)| {
-                (k.clone(), (v.offset as usize, v.len as usize))
-            })
-            .collect::<InputSignalsInfo>())
+        let mut inputs = InputSignalsInfo::new();
+        inputs.try_reserve(md.inputs.len()).map_err(|_| {
+            Error::new(ErrorKind::InvalidData, "input info allocation failed")
+        })?;
+        for (name, info) in md.inputs {
+            inputs.insert(
+                name,
+                (
+                    checked_usize(info.offset, "input offset")?,
+                    checked_usize(info.len, "input length")?,
+                ),
+            );
+        }
+        InputInfo::V1(inputs)
     } else if bytes.starts_with(WITNESSCALC_GRAPH_MAGIC_002) {
         let (input_info, types) = deserialize_input_signal_info(&md.input_signal_info)?;
         InputInfo::V2 { input_info, types }
@@ -176,7 +285,7 @@ pub fn decode_node<T: FieldOps + 'static, NS: NodesStorage + 'static>(
         4 => decode_duo_op_node(bytes, nodes),
         5 => decode_tres_op_node(bytes, nodes),
         _ => {
-            panic!("found unknown node")
+            Err(Error::new(ErrorKind::InvalidData, "found unknown node"))
         }
     }
 }
@@ -490,7 +599,8 @@ fn decode_constant_node<T: FieldOps + 'static, NS: NodesStorage + 'static>(
 fn read_tag(bytes: &[u8]) -> Result<(u32, WireType, usize), Error> {
     let (tag, consumed) = decode_varint_u32(bytes)?;
     let field_number = tag >> 3;
-    let wire_type = TryFrom::<u8>::try_from((tag & 0x7) as u8).unwrap();
+    let wire_type = TryFrom::<u8>::try_from((tag & 0x7) as u8)
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "unknown wire type"))?;
     Ok((field_number, wire_type, consumed))
 }
 

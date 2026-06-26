@@ -181,7 +181,7 @@ fn calc_witness_graph(
 
     let start = std::time::Instant::now();
     let (nodes, signals, input_info): (Box<dyn NodesInterface>, Vec<usize>, InputInfo) =
-        deserialize_witnesscalc_graph_from_bytes(graph_data).unwrap();
+        deserialize_witnesscalc_graph_from_bytes(graph_data)?;
     println!("Graph loaded in {:?}", start.elapsed());
 
     let start = std::time::Instant::now();
@@ -227,7 +227,7 @@ fn calc_witness_typed<T: FieldOps, NS: NodesStorage>(
     };
 
     let result = evaluate(
-        &nodes.ff, &nodes.nodes, &inputs, signals, &nodes.constants);
+        &nodes.ff, &nodes.nodes, &inputs, signals, &nodes.constants)?;
 
     Ok(result)
 }
@@ -238,12 +238,16 @@ fn init_inputs_from_inputs_mapping<T: FieldOps>(
 
     let mut inputs_len: usize = 1;
     for (offset, len) in inputs_info.values() {
-        let idx = offset + len;
+        let idx = offset.checked_add(*len)
+            .ok_or_else(|| anyhow!("input signal range overflows"))?;
         if idx > inputs_len {
             inputs_len = idx;
         }
     }
-    let mut inputs = vec![T::zero(); inputs_len];
+    let mut inputs = Vec::new();
+    inputs.try_reserve(inputs_len)
+        .map_err(|_| anyhow!("input signal allocation failed"))?;
+    inputs.resize(inputs_len, T::zero());
     inputs[0] = T::one();
     let mut inputs_filled = 1;
     for (key, value) in input_list {
@@ -256,7 +260,11 @@ fn init_inputs_from_inputs_mapping<T: FieldOps>(
                     return Err(anyhow!("Invalid input signal {} length: {}", key, len).into());
                 }
                 for (i, v) in value.iter().enumerate() {
-                    inputs[offset + i] = *v;
+                    let idx = offset.checked_add(i)
+                        .ok_or_else(|| anyhow!("input signal range overflows"))?;
+                    let slot = inputs.get_mut(idx)
+                        .ok_or_else(|| anyhow!("input signal range outside input length"))?;
+                    *slot = *v;
                     inputs_filled += 1;
                 }
             }

@@ -4,6 +4,7 @@ use std::collections::hash_map::Entry;
 use std::error::Error;
 use std::fmt::Debug;
 use std::fs::File;
+use std::io::{Error as IoError, ErrorKind};
 use std::ops::{BitOr, BitXor, Not};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -980,32 +981,82 @@ pub fn optimize<T: FieldOps + 'static, NS: NodesStorage + 'static>(
     tree_shake(nodes, outputs);
 }
 
+fn invalid_graph_data(msg: impl Into<String>) -> IoError {
+    IoError::new(ErrorKind::InvalidData, msg.into())
+}
+
+fn checked_graph_value<T: FieldOps>(
+    values: &[T],
+    idx: usize,
+    node_idx: usize,
+) -> std::io::Result<T> {
+    values.get(idx).copied().ok_or_else(|| {
+        invalid_graph_data(format!(
+            "node {} references value {} outside evaluated node range {}",
+            node_idx,
+            idx,
+            values.len(),
+        ))
+    })
+}
+
+fn checked_graph_input<T: FieldOps>(
+    values: &[T],
+    idx: usize,
+    what: &str,
+) -> std::io::Result<T> {
+    values.get(idx).copied().ok_or_else(|| {
+        invalid_graph_data(format!(
+            "{} index {} outside range {}",
+            what,
+            idx,
+            values.len(),
+        ))
+    })
+}
+
 pub fn evaluate<T: FieldOps, F: FieldOperations<Type = T>, NS: NodesStorage>(
     ff: F, nodes: &NS, inputs: &[T], outputs: &[usize],
-    constants: &[T]) -> Vec<T>
+    constants: &[T]) -> std::io::Result<Vec<T>>
 where Vec<T>: FromIterator<<F as FieldOperations>::Type>
 {
     // assert_valid(nodes);
 
     let start = Instant::now();
     // Evaluate the graph.
-    let mut values = Vec::with_capacity(nodes.len());
+    let mut values = Vec::new();
+    values.try_reserve(nodes.len())
+        .map_err(|_| invalid_graph_data("graph value allocation failed"))?;
     for i in 0..nodes.len() {
-        let node = nodes.get(i).unwrap();
+        let node = nodes.get(i).ok_or_else(|| {
+            invalid_graph_data(format!(
+                "node index {} outside node range {}",
+                i,
+                nodes.len(),
+            ))
+        })?;
         let value = match node {
-            Node::Unknown => panic!("Unknown node"),
-            Node::Constant(i) => constants[i],
-            Node::Input(i) => inputs[i],
+            Node::Unknown => {
+                return Err(invalid_graph_data(format!("unknown node at index {}", i)));
+            },
+            Node::Constant(idx) => checked_graph_input(constants, idx, "constant")?,
+            Node::Input(idx) => checked_graph_input(inputs, idx, "input")?,
             Node::Op(op, a, b) => {
-                ff.op_duo(op, values[a], values[b])
+                let a = checked_graph_value(&values, a, i)?;
+                let b = checked_graph_value(&values, b, i)?;
+                ff.op_duo(op, a, b)
             },
             Node::UnoOp(op, a) => {
-                ff.op_uno(op, values[a])
+                let a = checked_graph_value(&values, a, i)?;
+                ff.op_uno(op, a)
             },
             Node::TresOp(op, a, b, c) => {
+                let a = checked_graph_value(&values, a, i)?;
+                let b = checked_graph_value(&values, b, i)?;
+                let c = checked_graph_value(&values, c, i)?;
                 match op {
                     TresOperation::TernCond => {
-                        if values[a].is_zero() { values[c] } else { values[b] }
+                        if a.is_zero() { c } else { b }
                     },
                 }
             },
@@ -1013,9 +1064,14 @@ where Vec<T>: FromIterator<<F as FieldOperations>::Type>
         values.push(value);
     }
 
-    let r = outputs.iter().map(|&i| values[i]).collect();
+    let mut r = Vec::new();
+    r.try_reserve(outputs.len())
+        .map_err(|_| invalid_graph_data("graph witness allocation failed"))?;
+    for &i in outputs {
+        r.push(checked_graph_input(&values, i, "witness signal")?);
+    }
     println!("generic typed graph calculated in {:?}", start.elapsed());
-    r
+    Ok(r)
 }
 
 // pub fn evaluate_parallel(nodes: &[Node], inputs: &[U256], outputs: &[usize]) -> Vec<U256> {
@@ -1438,7 +1494,7 @@ mod tests {
     use std::ops::{Div};
     use super::*;
     use ruint::{uint};
-    use crate::field::U254;
+    use crate::field::{U254, U64};
 
     #[test]
     fn test_ok() {
@@ -1451,6 +1507,23 @@ mod tests {
         // println!("{}", rnd::<U254>());
         // let y = rng.gen::<[u8; 3]>();
         println!("{:?}", y);
+    }
+
+    #[test]
+    fn test_evaluate_rejects_input_index_outside_inputs() {
+        let ff = Field::new(U64::new(17));
+        let mut nodes = VecNodes::new();
+        nodes.push(Node::Input(1));
+
+        let err = evaluate(
+            &ff,
+            &nodes,
+            &[U64::new(3)],
+            &[0],
+            &[],
+        ).unwrap_err();
+
+        assert!(err.to_string().contains("input index 1 outside range 1"));
     }
 
     #[test]

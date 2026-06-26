@@ -286,21 +286,27 @@ fn init_inputs_from_v2<T: FieldOps>(
 ) -> Result<Vec<T>, Box<dyn std::error::Error>> {
     let inputs_size = input_info.get_total_size(types)?;
     let min_offset = input_info.min_offset().unwrap_or(0);
-    let signals_num = min_offset + inputs_size;
-    let mut component = Component::new(0, 0, vec![], inputs_size, signals_num);
+    let signals_num = min_offset.checked_add(inputs_size)
+        .ok_or_else(|| anyhow!("input signal range overflows"))?;
+    let mut component = Component::try_new(0, 0, vec![], inputs_size, signals_num)?;
     let inputs_cursor = Cursor::new(inputs_json.as_bytes());
     init_signals(inputs_cursor, ff, types, input_info, &mut component)?;
-    let mut component_signals = Vec::with_capacity(signals_num);
+    let mut component_signals = Vec::new();
+    component_signals.try_reserve(signals_num)
+        .map_err(|_| anyhow!("input signal allocation failed"))?;
     component.write_all_signals(&mut component_signals);
 
-    let mut inputs = Vec::with_capacity(inputs_size + 1);
+    let inputs_capacity = inputs_size.checked_add(1)
+        .ok_or_else(|| anyhow!("input signal range overflows"))?;
+    let mut inputs = Vec::new();
+    inputs.try_reserve(inputs_capacity)
+        .map_err(|_| anyhow!("input signal allocation failed"))?;
     inputs.push(T::one());
-    inputs.extend(
-        component_signals.iter()
-            .skip(min_offset)
-            .take(inputs_size)
-            .map(|x| x.expect(
-                "[assertion] init_signals should not allow None input signals")));
+    for signal in component_signals.iter().skip(min_offset).take(inputs_size) {
+        let value = signal
+            .ok_or_else(|| anyhow!("input signal was not set during initialization"))?;
+        inputs.push(value);
+    }
 
     Ok(inputs)
 }
@@ -486,10 +492,10 @@ pub fn calc_witness_vm2_buf(
     let mut reader = std::io::Cursor::new(&compiled_bytecode);
     let inputs_reader = std::io::Cursor::new(
         inputs_json.as_bytes());
-    let prime = read_witnesscalc_vm2_header(&mut reader).unwrap();
+    let prime = read_witnesscalc_vm2_header(&mut reader)?;
     if prime == num_bigint::BigUint::from_bytes_le(&bn254_prime.to_le_bytes_vec()) {
         let ff = Field::new(bn254_prime);
-        let circuit = deserialize_witnesscalc_vm2_body(&mut reader, ff).unwrap();
+        let circuit = deserialize_witnesscalc_vm2_body(&mut reader, ff)?;
         let mut witness_buf: Vec<u8> = Vec::new();
         calculate_witness_vm2(&circuit, inputs_reader, &mut witness_buf)?;
         Ok(witness_buf)
@@ -517,7 +523,7 @@ pub fn calculate_witness_vm2<T: FieldOps>(
         .map_err(|e| -> Box<dyn std::error::Error> { e })?;
     println!("VM2 executed in {:?}", start.elapsed());
 
-    let witness_signals = witness_signals(&component_tree, &circuit.witness);
+    let witness_signals = witness_signals(&component_tree, &circuit.witness)?;
     let wtns_data = witness(witness_signals, circuit.field.prime)?;
 
     w.write_all(&wtns_data)?;
@@ -528,24 +534,32 @@ pub fn calculate_witness_vm2<T: FieldOps>(
 
 fn witness_signals<T: FieldOps>(
     component_tree: &vm2::Component<T>,
-    witness_signals: &[usize]) -> Vec<T> {
+    witness_signals: &[usize]) -> Result<Vec<T>, Box<dyn std::error::Error>> {
 
     let start = std::time::Instant::now();
-    let signals_num = component_tree.total_signals_len() + 1;
-    let mut signals = Vec::with_capacity(signals_num);
+    let signals_num = component_tree.try_total_signals_len()?.checked_add(1)
+        .ok_or_else(|| anyhow!("witness signal range overflows"))?;
+    let mut signals = Vec::new();
+    signals.try_reserve(signals_num)
+        .map_err(|_| anyhow!("witness signal allocation failed"))?;
     signals.push(Some(T::one()));
     component_tree.write_all_signals(&mut signals);
 
-    let mut witness: Vec<T> = Vec::with_capacity(witness_signals.len());
+    let mut witness: Vec<T> = Vec::new();
+    witness.try_reserve(witness_signals.len())
+        .map_err(|_| anyhow!("witness signal allocation failed"))?;
     for idx in witness_signals {
-        witness.push(signals[*idx].unwrap_or_else(T::zero));
+        let signal = signals.get(*idx)
+            .ok_or_else(|| anyhow!("witness signal index outside signal range"))?;
+        let signal = signal.ok_or_else(|| anyhow!("witness signal is unset"))?;
+        witness.push(signal);
     }
 
     println!(
         "Witness signals gathered in {:?}. Total signals: {}, witness signals: {}.",
         start.elapsed(), signals_num, witness.len());
 
-    witness
+    Ok(witness)
 }
 fn witness<T: FieldOps>(
     witness_signals: Vec<T>,
@@ -586,6 +600,7 @@ mod tests {
     use ruint::uint;
     use crate::proto::InputNode;
     use crate::field::{Field, U254, bn254_prime};
+    use crate::vm2::{Component, InputInfo};
 
     #[test]
     fn test_ok() {
@@ -637,5 +652,48 @@ mod tests {
             U254::from(2),
             U254::from(3)]);
         assert_eq!(res, want);
+    }
+
+    #[test]
+    fn test_input_mapping_range_overflow_returns_error() {
+        let input_list = HashMap::<String, Vec<U254>>::new();
+        let inputs_info = HashMap::from([
+            ("a".to_string(), (usize::MAX, 1usize)),
+        ]);
+
+        let err = super::init_inputs_from_inputs_mapping(&input_list, &inputs_info)
+            .unwrap_err();
+        assert!(err.to_string().contains("overflows"));
+    }
+
+    #[test]
+    fn test_v2_input_signal_range_overflow_returns_error() {
+        let ff = Field::new(bn254_prime);
+        let input_info = vec![InputInfo {
+            name: "a".to_string(),
+            offset: usize::MAX,
+            lengths: vec![],
+            type_id: None,
+        }];
+
+        let err = super::init_inputs_from_v2::<U254>("{}", &ff, &input_info, &[])
+            .unwrap_err();
+        assert!(err.to_string().contains("overflows"));
+    }
+
+    #[test]
+    fn test_witness_signal_outside_signal_range_returns_error() {
+        let component = Component::<U254>::new(1, 0, vec![], 0, 1);
+
+        let err = super::witness_signals(&component, &[2]).unwrap_err();
+        assert!(err.to_string().contains("outside"));
+    }
+
+    #[test]
+    fn test_witness_signal_unset_returns_error() {
+        let component = Component::<U254>::new(1, 0, vec![], 0, 1);
+
+        let err = super::witness_signals(&component, &[1]).unwrap_err();
+        assert!(err.to_string().contains("unset"));
     }
 }

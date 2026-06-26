@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::error::Error;
+use std::io::{Error as IoError, ErrorKind};
 #[cfg(feature = "parallel_components")]
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 #[cfg(not(feature = "parallel_components"))]
@@ -17,30 +18,40 @@ pub struct InputInfo {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("unknown type error")]
-pub struct UnknownTypeName();
+pub enum InputInfoSizeError {
+    #[error("unknown type error")]
+    UnknownTypeName,
+    #[error("{0}")]
+    SizeOverflow(&'static str),
+}
 
 pub trait InputInfoSliceExt {
-    fn get_total_size(&self, types: &[Type]) -> Result<usize, UnknownTypeName>;
+    fn get_total_size(&self, types: &[Type]) -> Result<usize, InputInfoSizeError>;
     fn min_offset(&self) -> Option<usize>;
 }
 
 impl InputInfoSliceExt for [InputInfo] {
-    fn get_total_size(&self, types: &[Type]) -> Result<usize, UnknownTypeName> {
+    fn get_total_size(&self, types: &[Type]) -> Result<usize, InputInfoSizeError> {
         let mut total_size = 0usize;
         for i in self {
             let base_type_size: usize = match &i.type_id {
                 None => 1,
                 Some(type_id) => {
                     match types.iter().find(|x| &x.name == type_id) {
-                        None => { return Err(UnknownTypeName()); }
-                        Some(t) => t.get_total_size()
+                        None => { return Err(InputInfoSizeError::UnknownTypeName); }
+                        Some(t) => t.checked_total_size()?
                     }
                 }
             };
 
-            total_size += i.lengths.iter().product::<usize>()
-                * base_type_size;
+            let dim_product = i.lengths.iter().try_fold(1usize, |acc, dim| {
+                acc.checked_mul(*dim)
+                    .ok_or(InputInfoSizeError::SizeOverflow("input signal size overflows"))
+            })?;
+            let item_size = dim_product.checked_mul(base_type_size)
+                .ok_or(InputInfoSizeError::SizeOverflow("input signal size overflows"))?;
+            total_size = total_size.checked_add(item_size)
+                .ok_or(InputInfoSizeError::SizeOverflow("input signal size overflows"))?;
         }
         Ok(total_size)
     }
@@ -324,12 +335,29 @@ pub struct Signals<T: FieldOps> {
     signals: Vec<T>,
 }
 
+fn invalid_data(msg: &'static str) -> Box<dyn Error> {
+    Box::new(IoError::new(ErrorKind::InvalidData, msg))
+}
+
 impl <T: FieldOps> Signals<T> {
-    pub fn new(n: usize) -> Signals<T> {
-        Signals {
-            present: BitVec::<usize, Lsb0>::repeat(false, n),
-            signals: vec![T::zero(); n],
-        }
+    fn try_new(n: usize) -> Result<Signals<T>, Box<dyn Error>> {
+        let bits_per_word = usize::BITS as usize;
+        let words = n.checked_add(bits_per_word - 1)
+            .ok_or_else(|| invalid_data("signal presence allocation failed"))?
+            / bits_per_word;
+        let mut present_words = Vec::new();
+        present_words.try_reserve(words)
+            .map_err(|_| invalid_data("signal presence allocation failed"))?;
+        present_words.resize(words, 0usize);
+        let mut present = BitVec::<usize, Lsb0>::from_vec(present_words);
+        present.truncate(n);
+
+        let mut signals = Vec::new();
+        signals.try_reserve(n)
+            .map_err(|_| invalid_data("signal allocation failed"))?;
+        signals.resize(n, T::zero());
+
+        Ok(Signals { present, signals })
     }
 
     pub fn set(&mut self, idx: usize, val: T) -> Result<(), Box<dyn Error + Sync + Send>> {
@@ -388,20 +416,40 @@ pub struct Component<T: FieldOps> {
 }
 
 impl <T: FieldOps> Component<T> {
+    /// Panicking convenience wrapper around [`Component::try_new`]. Paths that
+    /// build components from artifact-controlled sizes must use `try_new`.
     pub fn new(
         signals_start: usize,
         template_id: usize,
         components: Vec<Option<Arc<RwLock<Component<T>>>>>,
         number_of_inputs: usize,
         signals_num: usize) -> Component<T> {
-        Component {
+        Component::try_new(
             signals_start,
             template_id,
             components,
             number_of_inputs,
-            signals: Signals::new(signals_num),
-            execution_result: Arc::new(OnceLock::new()),
+            signals_num,
+        ).expect("component signal allocation failed")
+    }
+
+    pub(crate) fn try_new(
+        signals_start: usize,
+        template_id: usize,
+        components: Vec<Option<Arc<RwLock<Component<T>>>>>,
+        number_of_inputs: usize,
+        signals_num: usize) -> Result<Component<T>, Box<dyn Error>> {
+        if number_of_inputs > signals_num {
+            return Err(invalid_data("component input count exceeds signal count"));
         }
+        Ok(Component {
+            signals_start,
+            template_id,
+            components,
+            number_of_inputs,
+            signals: Signals::try_new(signals_num)?,
+            execution_result: Arc::new(OnceLock::new()),
+        })
     }
 
     pub fn set_signal(&mut self, idx: usize, val: T) -> Result<(), Box<dyn Error + Sync + Send>> {
@@ -432,6 +480,16 @@ impl <T: FieldOps> Component<T> {
         // self.signals.signals_len() + self.components2.iter().flatten().fold(
         //     0,
         // |acc, x| {acc + x.read().unwrap().total_signals_len()})
+    }
+
+    pub(crate) fn try_total_signals_len(&self) -> Result<usize, Box<dyn Error>> {
+        let mut total = self.signals.signals_len();
+        for component in self.components.iter().flatten() {
+            let component_len = component.read().unwrap().try_total_signals_len()?;
+            total = total.checked_add(component_len)
+                .ok_or_else(|| invalid_data("component signal range overflows"))?;
+        }
+        Ok(total)
     }
 
     pub fn write_all_signals(&self, signals: &mut Vec<Option<T>>) {
@@ -3123,6 +3181,14 @@ impl Type {
     pub fn get_total_size(&self) -> usize {
         self.fields.iter().map(|f| f.get_total_size()).sum()
     }
+
+    fn checked_total_size(&self) -> Result<usize, InputInfoSizeError> {
+        self.fields.iter().try_fold(0usize, |acc, field| {
+            let field_size = field.checked_total_size()?;
+            acc.checked_add(field_size)
+                .ok_or(InputInfoSizeError::SizeOverflow("type size overflows"))
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3142,6 +3208,19 @@ impl TypeField {
             self.base_type_size
         } else {
             self.base_type_size * dim_product
+        }
+    }
+
+    fn checked_total_size(&self) -> Result<usize, InputInfoSizeError> {
+        let dim_product = self.dims.iter().try_fold(1usize, |acc, dim| {
+            acc.checked_mul(*dim)
+                .ok_or(InputInfoSizeError::SizeOverflow("type field size overflows"))
+        })?;
+        if dim_product == 0 {
+            Ok(self.base_type_size)
+        } else {
+            self.base_type_size.checked_mul(dim_product)
+                .ok_or(InputInfoSizeError::SizeOverflow("type field size overflows"))
         }
     }
 }
@@ -3188,6 +3267,8 @@ impl TypeField {
 mod tests {
     // use bitvec::vec::BitVec;
     use bitvec::prelude::*;
+    use crate::field::U254;
+    use super::Component;
 
     #[test]
     fn test_ok() {
@@ -3201,5 +3282,15 @@ mod tests {
 
         println!("{:?}", x[4001]);
         println!("OK");
+    }
+
+    #[test]
+    fn test_component_try_new_rejects_too_many_inputs() {
+        let err = match Component::<U254>::try_new(0, 0, vec![], 2, 1) {
+            Ok(_) => panic!("expected component input count to fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("input count"));
     }
 }
